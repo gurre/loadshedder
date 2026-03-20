@@ -9,29 +9,26 @@ import (
 	"testing"
 )
 
-// BenchmarkLoadShedder_Handler_InFlightLimit benchmarks the handler when in-flight limit is hit
-func BenchmarkLoadShedder_Handler_InFlightLimit(b *testing.B) {
+// BenchmarkLoadShedder_Handler_Rejection measures the cost of rejecting a
+// request via per-IP in-flight limit (the cheapest rejection path after
+// the server-wide checks).
+func BenchmarkLoadShedder_Handler_Rejection(b *testing.B) {
 	ls := New(
-		WithTokenBucketCapacity(1000000),
-		WithTokenBucketRefillRatePerSecond(1000000),
-		WithMaxRequestsInFlight(1), // Very low limit
+		WithPerIPBurst(1<<30),
+		WithPerIPRatePerSecond(0),
+		WithPerIPMaxInFlight(0), // reject everything at in-flight check
 	)
 	defer ls.Stop()
 
-	// Use a handler that takes time to complete to ensure in-flight limit is hit
-	handler := ls.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Simulate work
-		_ = atomic.AddInt64(&ls.requestCount, 0) // Access shared state
-		w.WriteHeader(http.StatusOK)
-	}))
+	handler := ls.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+
+	r := httptest.NewRequest("GET", "/test", nil)
+	r.RemoteAddr = "192.168.1.1:8080"
 
 	b.ResetTimer()
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		r := httptest.NewRequest("GET", "/test", nil)
-		r.RemoteAddr = "192.168.1.1:8080"
-		w := httptest.NewRecorder()
-		handler.ServeHTTP(w, r)
+		handler.ServeHTTP(discardResponseWriter{}, r)
 	}
 }
 
@@ -60,7 +57,7 @@ func BenchmarkLoadShedder_TokenBucketCreation(b *testing.B) {
 
 // BenchmarkLoadShedder_TokenBucket_TryTake_Success benchmarks successful token take
 func BenchmarkLoadShedder_TokenBucket_TryTake_Success(b *testing.B) {
-	tb := NewTokenBucket(b.N*2, 0) // Enough tokens for all operations
+	tb := NewTokenBucket(1<<30, 0)
 
 	b.ResetTimer()
 	b.ReportAllocs()
@@ -112,9 +109,9 @@ func BenchmarkLoadShedder_TokenBucket_Refill(b *testing.B) {
 // BenchmarkLoadShedder_Cleanup benchmarks cleanup operation
 func BenchmarkLoadShedder_Cleanup(b *testing.B) {
 	ls := New(
-		WithTokenBucketCapacity(100),
-		WithTokenBucketRefillRatePerSecond(10),
-		WithMaxRequestsInFlight(10),
+		WithPerIPBurst(100),
+		WithPerIPRatePerSecond(10),
+		WithPerIPMaxInFlight(10),
 	)
 	defer ls.Stop()
 
@@ -160,9 +157,9 @@ func BenchmarkLoadShedder_ShardedMapOperations(b *testing.B) {
 // BenchmarkLoadShedder_FullRequestFlow benchmarks the complete request flow
 func BenchmarkLoadShedder_FullRequestFlow(b *testing.B) {
 	ls := New(
-		WithTokenBucketCapacity(1000),
-		WithTokenBucketRefillRatePerSecond(100),
-		WithMaxRequestsInFlight(50),
+		WithPerIPBurst(1000),
+		WithPerIPRatePerSecond(100),
+		WithPerIPMaxInFlight(50),
 	)
 	defer ls.Stop()
 
@@ -194,9 +191,9 @@ func BenchmarkLoadShedder_FullRequestFlow(b *testing.B) {
 // httptest allocation noise from the measurement.
 func BenchmarkLoadShedder_HandlerOverhead(b *testing.B) {
 	ls := New(
-		WithTokenBucketCapacity(b.N+1),
-		WithTokenBucketRefillRatePerSecond(0),
-		WithMaxRequestsInFlight(1000),
+		WithPerIPBurst(1<<30),
+		WithPerIPRatePerSecond(0),
+		WithPerIPMaxInFlight(1<<30),
 	)
 	defer ls.Stop()
 
@@ -217,9 +214,9 @@ func BenchmarkLoadShedder_HandlerOverhead(b *testing.B) {
 // httptest allocations.
 func BenchmarkLoadShedder_HandlerOverhead_Parallel(b *testing.B) {
 	ls := New(
-		WithTokenBucketCapacity(1000000),
-		WithTokenBucketRefillRatePerSecond(1000000),
-		WithMaxRequestsInFlight(1000),
+		WithPerIPBurst(1<<30),
+		WithPerIPRatePerSecond(0),
+		WithPerIPMaxInFlight(1<<30),
 	)
 	defer ls.Stop()
 
@@ -238,6 +235,8 @@ func BenchmarkLoadShedder_HandlerOverhead_Parallel(b *testing.B) {
 }
 
 // discardResponseWriter is a no-op http.ResponseWriter that avoids httptest.NewRecorder allocations.
+// Header() returns a fresh map because http.Error writes to it, which would
+// race under parallel benchmarks with a shared map.
 type discardResponseWriter struct{}
 
 func (discardResponseWriter) Header() http.Header         { return http.Header{} }
@@ -251,21 +250,24 @@ func (discardResponseWriter) WriteHeader(int)             {}
 // isolate middleware cost from application and httptest overhead.
 func BenchmarkLoadShedder_MaxThroughput(b *testing.B) {
 	ls := New(
-		WithTokenBucketCapacity(1<<30),
-		WithTokenBucketRefillRatePerSecond(0),
-		WithMaxRequestsInFlight(1<<30),
+		WithPerIPBurst(1<<30),
+		WithPerIPRatePerSecond(0),
+		WithPerIPMaxInFlight(1<<30),
 	)
 	defer ls.Stop()
 
 	handler := ls.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
 
+	var goroutineID atomic.Int64
+
 	b.ResetTimer()
 	b.ReportAllocs()
 	b.RunParallel(func(pb *testing.PB) {
 		// Each goroutine gets its own IP so buckets never collide.
+		id := goroutineID.Add(1)
 		r := httptest.NewRequest("GET", "/", nil)
 		r.RemoteAddr = fmt.Sprintf("%d.%d.%d.%d:1234",
-			b.N%256, (b.N/256)%256, (b.N/65536)%256, (b.N/16777216)%256)
+			id%256, (id/256)%256, (id/65536)%256, (id/16777216)%256)
 		for pb.Next() {
 			handler.ServeHTTP(discardResponseWriter{}, r)
 		}
@@ -280,9 +282,9 @@ func BenchmarkLoadShedder_MaxThroughput(b *testing.B) {
 // throughput where all cores contend on a single client bucket.
 func BenchmarkLoadShedder_MaxThroughput_SingleIP(b *testing.B) {
 	ls := New(
-		WithTokenBucketCapacity(1<<30),
-		WithTokenBucketRefillRatePerSecond(0),
-		WithMaxRequestsInFlight(1<<30),
+		WithPerIPBurst(1<<30),
+		WithPerIPRatePerSecond(0),
+		WithPerIPMaxInFlight(1<<30),
 	)
 	defer ls.Stop()
 
@@ -303,28 +305,80 @@ func BenchmarkLoadShedder_MaxThroughput_SingleIP(b *testing.B) {
 	}
 }
 
-// BenchmarkLoadShedder_HighContention benchmarks high contention scenario
-func BenchmarkLoadShedder_HighContention(b *testing.B) {
+// BenchmarkLoadShedder_ServerRateLimit benchmarks overhead of server-wide token bucket
+func BenchmarkLoadShedder_ServerRateLimit(b *testing.B) {
 	ls := New(
-		WithTokenBucketCapacity(10), // Small bucket to create contention
-		WithTokenBucketRefillRatePerSecond(5),
-		WithMaxRequestsInFlight(5), // Low in-flight limit
+		WithPerIPBurst(1<<30),
+		WithPerIPRatePerSecond(0),
+		WithPerIPMaxInFlight(1<<30),
+		WithServerBurst(1<<30),
+		WithServerRatePerSecond(0),
 	)
 	defer ls.Stop()
 
-	handler := ls.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	}))
+	handler := ls.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	r := httptest.NewRequest("GET", "/", nil)
+	r.RemoteAddr = "10.0.0.1:1234"
 
 	b.ResetTimer()
 	b.ReportAllocs()
 	b.RunParallel(func(pb *testing.PB) {
-		// All goroutines use same IP to maximize contention
-		r := httptest.NewRequest("GET", "/test", nil)
-		r.RemoteAddr = "192.168.1.1:8080"
 		for pb.Next() {
-			w := httptest.NewRecorder()
-			handler.ServeHTTP(w, r)
+			handler.ServeHTTP(discardResponseWriter{}, r)
+		}
+	})
+}
+
+// BenchmarkLoadShedder_ServerAndPerIP benchmarks combined server-wide + per-IP overhead
+func BenchmarkLoadShedder_ServerAndPerIP(b *testing.B) {
+	ls := New(
+		WithPerIPBurst(1<<30),
+		WithPerIPRatePerSecond(0),
+		WithPerIPMaxInFlight(1<<30),
+		WithServerBurst(1<<30),
+		WithServerRatePerSecond(0),
+		WithServerMaxInFlight(1<<30),
+	)
+	defer ls.Stop()
+
+	handler := ls.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+
+	var goroutineID atomic.Int64
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	b.RunParallel(func(pb *testing.PB) {
+		id := goroutineID.Add(1)
+		r := httptest.NewRequest("GET", "/", nil)
+		r.RemoteAddr = fmt.Sprintf("%d.%d.%d.%d:1234",
+			id%256, (id/256)%256, (id/65536)%256, (id/16777216)%256)
+		for pb.Next() {
+			handler.ServeHTTP(discardResponseWriter{}, r)
+		}
+	})
+}
+
+// BenchmarkLoadShedder_HighContention benchmarks high contention scenario
+// where all goroutines share a single IP with a small bucket and low
+// in-flight limit, maximizing cross-core contention on the same shard.
+func BenchmarkLoadShedder_HighContention(b *testing.B) {
+	ls := New(
+		WithPerIPBurst(10),
+		WithPerIPRatePerSecond(5),
+		WithPerIPMaxInFlight(5),
+	)
+	defer ls.Stop()
+
+	handler := ls.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+
+	r := httptest.NewRequest("GET", "/test", nil)
+	r.RemoteAddr = "192.168.1.1:8080"
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			handler.ServeHTTP(discardResponseWriter{}, r)
 		}
 	})
 }
