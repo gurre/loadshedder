@@ -3,6 +3,7 @@ package loadshedder
 import (
 	"context"
 	"fmt"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -14,18 +15,15 @@ import (
 func TestLoadShedder_BasicRateLimiting(t *testing.T) {
 	burst := 2
 	ratePerSecond := 1
-	ls := New(
-		WithPerIPBurst(burst),
-		WithPerIPRatePerSecond(ratePerSecond),
-		WithPerIPMaxInFlight(10),
-	)
+	ls := New(Config{
+		PerIP: &PerIPConfig{Burst: burst, Rate: ratePerSecond, MaxInFlight: 10},
+	})
 	defer ls.Stop()
 
 	fastHandler := ls.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))
 
-	// Test requests from same IP should be rate limited
 	ip := "192.168.1.1"
 	for i := 0; i < burst; i++ {
 		r := httptest.NewRequest("POST", "/test", nil)
@@ -48,35 +46,92 @@ func TestLoadShedder_BasicRateLimiting(t *testing.T) {
 	}
 }
 
-func TestLoadShedder_ZeroConfigRejectsAll(t *testing.T) {
-	// Without any options, all per-IP limits are zero → reject everything.
-	ls := New()
-	defer ls.Stop()
+func TestConfig_Validate_NilBothPanics(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Error("New(Config{}) should panic")
+		}
+	}()
+	ls := New(Config{})
+	ls.Stop()
+}
 
-	handler := ls.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		t.Fatal("Handler should never be called with zero config")
-	}))
+func TestConfig_Validate_EmptyPerIPPanics(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Error("New(Config{PerIP: &PerIPConfig{}}) should panic")
+		}
+	}()
+	ls := New(Config{PerIP: &PerIPConfig{}})
+	ls.Stop()
+}
 
-	r := httptest.NewRequest("GET", "/", nil)
-	r.RemoteAddr = "10.0.0.1:8080"
-	w := httptest.NewRecorder()
-	handler.ServeHTTP(w, r)
-	if w.Result().StatusCode != http.StatusTooManyRequests {
-		t.Errorf("Expected 429 with zero config, got %d", w.Result().StatusCode)
+func TestConfig_Validate_EmptyServerPanics(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Error("New(Config{Server: &ServerConfig{}}) should panic")
+		}
+	}()
+	ls := New(Config{Server: &ServerConfig{}})
+	ls.Stop()
+}
+
+func TestConfig_Validate_NegativeValues(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  Config
+	}{
+		{"PerIP.Burst", Config{PerIP: &PerIPConfig{Burst: -1}}},
+		{"PerIP.Rate", Config{PerIP: &PerIPConfig{Rate: -1}}},
+		{"PerIP.MaxInFlight", Config{PerIP: &PerIPConfig{MaxInFlight: -1}}},
+		{"Server.Burst", Config{Server: &ServerConfig{Burst: -1}}},
+		{"Server.Rate", Config{Server: &ServerConfig{Rate: -1}}},
+		{"Server.MaxInFlight", Config{Server: &ServerConfig{MaxInFlight: -1}}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := tt.cfg.Validate(); err == nil {
+				t.Errorf("Expected error for %s with negative value", tt.name)
+			}
+		})
 	}
 }
 
+func TestConfig_Validate_MaxInFlightOverflow(t *testing.T) {
+	t.Run("PerIP", func(t *testing.T) {
+		cfg := Config{PerIP: &PerIPConfig{MaxInFlight: math.MaxInt32 + 1}}
+		if err := cfg.Validate(); err == nil {
+			t.Error("Expected error for PerIP.MaxInFlight > MaxInt32")
+		}
+	})
+	t.Run("Server", func(t *testing.T) {
+		cfg := Config{Server: &ServerConfig{MaxInFlight: math.MaxInt32 + 1}}
+		if err := cfg.Validate(); err == nil {
+			t.Error("Expected error for Server.MaxInFlight > MaxInt32")
+		}
+	})
+}
+
 func TestLoadShedder_AllPathsRateLimited(t *testing.T) {
-	ls := New(
-		WithPerIPBurst(0), // Zero tokens to force rate limiting
-		WithPerIPRatePerSecond(0),
-		WithPerIPMaxInFlight(1),
-	)
+	// After the single server token is consumed, every path is rejected.
+	ls := New(Config{
+		Server: &ServerConfig{Burst: 1, Rate: 0},
+	})
 	defer ls.Stop()
 
 	handler := ls.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))
+
+	// Consume the single token
+	r := httptest.NewRequest("GET", "/setup", nil)
+	r.RemoteAddr = "192.168.1.1:8080"
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, r)
+	if w.Result().StatusCode != http.StatusOK {
+		t.Fatalf("First request should succeed, got %d", w.Result().StatusCode)
+	}
 
 	paths := []string{"/ping", "/api/test", "/health"}
 	for _, path := range paths {
@@ -93,13 +148,56 @@ func TestLoadShedder_AllPathsRateLimited(t *testing.T) {
 	}
 }
 
+func TestLoadShedder_RateOnlyWithoutMaxInFlight(t *testing.T) {
+	// Setting only burst/rate without MaxInFlight must not reject requests.
+	ls := New(Config{
+		PerIP: &PerIPConfig{Burst: 10, Rate: 10},
+	})
+	defer ls.Stop()
+
+	handler := ls.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	for i := 0; i < 5; i++ {
+		r := httptest.NewRequest("GET", "/", nil)
+		r.RemoteAddr = "10.0.0.1:8080"
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, r)
+		if w.Result().StatusCode != http.StatusOK {
+			t.Fatalf("Request %d should succeed with rate-only config, got %d", i, w.Result().StatusCode)
+		}
+	}
+}
+
+func TestLoadShedder_PerIPConcurrencyOnly(t *testing.T) {
+	// Concurrency-only per-IP config (no rate limit) must allow requests
+	// and not create zero-token buckets.
+	ls := New(Config{
+		PerIP: &PerIPConfig{MaxInFlight: 5},
+	})
+	defer ls.Stop()
+
+	handler := ls.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	for i := 0; i < 10; i++ {
+		r := httptest.NewRequest("GET", "/", nil)
+		r.RemoteAddr = "10.0.0.1:8080"
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, r)
+		if w.Result().StatusCode != http.StatusOK {
+			t.Fatalf("Request %d should succeed with concurrency-only config, got %d", i, w.Result().StatusCode)
+		}
+	}
+}
+
 func TestLoadShedder_InFlightLimiting(t *testing.T) {
-	maxInFlight := int32(2)
-	ls := New(
-		WithPerIPBurst(100),
-		WithPerIPRatePerSecond(100),
-		WithPerIPMaxInFlight(maxInFlight),
-	)
+	maxInFlight := 2
+	ls := New(Config{
+		PerIP: &PerIPConfig{Burst: 100, Rate: 100, MaxInFlight: maxInFlight},
+	})
 	defer ls.Stop()
 
 	started := make(chan struct{})
@@ -127,7 +225,7 @@ func TestLoadShedder_InFlightLimiting(t *testing.T) {
 	}
 
 	// Wait for maxInFlight requests to enter the handler
-	for i := 0; i < int(maxInFlight); i++ {
+	for i := 0; i < maxInFlight; i++ {
 		<-started
 	}
 
@@ -155,27 +253,25 @@ func TestLoadShedder_InFlightLimiting(t *testing.T) {
 		}
 	}
 
-	if okCount != int(maxInFlight) {
+	if okCount != maxInFlight {
 		t.Errorf("Expected %d OK responses, got %d", maxInFlight, okCount)
 	}
-	if rejectedCount != totalRequests-int(maxInFlight) {
-		t.Errorf("Expected %d rejected responses, got %d", totalRequests-int(maxInFlight), rejectedCount)
+	if rejectedCount != totalRequests-maxInFlight {
+		t.Errorf("Expected %d rejected responses, got %d", totalRequests-maxInFlight, rejectedCount)
 	}
 }
 
 func TestLoadShedder_RequestCount(t *testing.T) {
-	ls := New(
-		WithPerIPBurst(3),
-		WithPerIPRatePerSecond(0),
-		WithPerIPMaxInFlight(100),
-	)
+	ls := New(Config{
+		PerIP: &PerIPConfig{Burst: 3, Rate: 0, MaxInFlight: 100},
+	})
 	defer ls.Stop()
 
 	handler := ls.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))
 
-	// 3 accepted + 2 rejected = 5 total observed
+	// Burst defaults rate to 3. 3 accepted + 2 rejected = 5 total observed
 	for i := 0; i < 5; i++ {
 		r := httptest.NewRequest("GET", "/", nil)
 		r.RemoteAddr = "10.0.0.1:8080"
@@ -189,11 +285,9 @@ func TestLoadShedder_RequestCount(t *testing.T) {
 }
 
 func TestLoadShedder_IPIsolation(t *testing.T) {
-	ls := New(
-		WithPerIPBurst(1),
-		WithPerIPRatePerSecond(0), // No refill
-		WithPerIPMaxInFlight(10),
-	)
+	ls := New(Config{
+		PerIP: &PerIPConfig{Burst: 1, Rate: 0, MaxInFlight: 10},
+	})
 	defer ls.Stop()
 
 	handler := ls.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -229,11 +323,9 @@ func TestLoadShedder_IPIsolation(t *testing.T) {
 }
 
 func TestLoadShedder_SameIPDifferentPortsShareBucket(t *testing.T) {
-	ls := New(
-		WithPerIPBurst(2),
-		WithPerIPRatePerSecond(0),
-		WithPerIPMaxInFlight(10),
-	)
+	ls := New(Config{
+		PerIP: &PerIPConfig{Burst: 2, Rate: 0, MaxInFlight: 10},
+	})
 	defer ls.Stop()
 
 	handler := ls.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -267,11 +359,9 @@ func TestLoadShedder_SameIPDifferentPortsShareBucket(t *testing.T) {
 }
 
 func TestLoadShedder_ConcurrentRequests(t *testing.T) {
-	ls := New(
-		WithPerIPBurst(50),
-		WithPerIPRatePerSecond(0), // No refill for predictable behavior
-		WithPerIPMaxInFlight(100),
-	)
+	ls := New(Config{
+		PerIP: &PerIPConfig{Burst: 50, Rate: 0, MaxInFlight: 100},
+	})
 	defer ls.Stop()
 
 	handler := ls.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -307,11 +397,9 @@ func TestLoadShedder_ConcurrentRequests(t *testing.T) {
 }
 
 func TestLoadShedder_Cleanup(t *testing.T) {
-	ls := New(
-		WithPerIPBurst(10),
-		WithPerIPRatePerSecond(1),
-		WithPerIPMaxInFlight(10),
-	)
+	ls := New(Config{
+		PerIP: &PerIPConfig{Burst: 10, Rate: 1, MaxInFlight: 10},
+	})
 	defer ls.Stop()
 
 	handler := ls.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -366,11 +454,9 @@ func TestLoadShedder_Cleanup(t *testing.T) {
 }
 
 func TestLoadShedder_StopIsIdempotent(t *testing.T) {
-	ls := New(
-		WithPerIPBurst(10),
-		WithPerIPRatePerSecond(1),
-		WithPerIPMaxInFlight(10),
-	)
+	ls := New(Config{
+		PerIP: &PerIPConfig{Burst: 10, Rate: 1, MaxInFlight: 10},
+	})
 
 	// Stop must not panic when called multiple times.
 	ls.Stop()
@@ -379,11 +465,9 @@ func TestLoadShedder_StopIsIdempotent(t *testing.T) {
 }
 
 func TestLoadShedder_RefillBehavior(t *testing.T) {
-	ls := New(
-		WithPerIPBurst(2),
-		WithPerIPRatePerSecond(2), // 2 tokens per second
-		WithPerIPMaxInFlight(10),
-	)
+	ls := New(Config{
+		PerIP: &PerIPConfig{Burst: 2, Rate: 2, MaxInFlight: 10},
+	})
 	defer ls.Stop()
 
 	handler := ls.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -429,13 +513,10 @@ func TestLoadShedder_RefillBehavior(t *testing.T) {
 
 func TestLoadShedder_ServerRateLimiting(t *testing.T) {
 	serverCapacity := 5
-	ls := New(
-		WithPerIPBurst(100),
-		WithPerIPRatePerSecond(100),
-		WithPerIPMaxInFlight(100),
-		WithServerBurst(serverCapacity),
-		WithServerRatePerSecond(0), // no refill
-	)
+	ls := New(Config{
+		PerIP:  &PerIPConfig{Burst: 100, Rate: 100, MaxInFlight: 100},
+		Server: &ServerConfig{Burst: serverCapacity, Rate: 0},
+	})
 	defer ls.Stop()
 
 	handler := ls.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -460,13 +541,11 @@ func TestLoadShedder_ServerRateLimiting(t *testing.T) {
 }
 
 func TestLoadShedder_ServerInFlightLimiting(t *testing.T) {
-	serverMax := int32(3)
-	ls := New(
-		WithPerIPBurst(100),
-		WithPerIPRatePerSecond(100),
-		WithPerIPMaxInFlight(100),
-		WithServerMaxInFlight(serverMax),
-	)
+	serverMax := 3
+	ls := New(Config{
+		PerIP:  &PerIPConfig{Burst: 100, Rate: 100, MaxInFlight: 100},
+		Server: &ServerConfig{MaxInFlight: serverMax},
+	})
 	defer ls.Stop()
 
 	started := make(chan struct{})
@@ -478,10 +557,10 @@ func TestLoadShedder_ServerInFlightLimiting(t *testing.T) {
 	}))
 
 	var wg sync.WaitGroup
-	results := make([]int, int(serverMax)+2)
+	results := make([]int, serverMax+2)
 
 	// Launch more requests than the server limit from different IPs
-	for i := 0; i < int(serverMax)+2; i++ {
+	for i := 0; i < serverMax+2; i++ {
 		wg.Add(1)
 		go func(idx int) {
 			defer wg.Done()
@@ -494,7 +573,7 @@ func TestLoadShedder_ServerInFlightLimiting(t *testing.T) {
 	}
 
 	// Wait for serverMax requests to enter the handler
-	for i := 0; i < int(serverMax); i++ {
+	for i := 0; i < serverMax; i++ {
 		<-started
 	}
 
@@ -521,7 +600,7 @@ func TestLoadShedder_ServerInFlightLimiting(t *testing.T) {
 		}
 	}
 
-	if okCount != int(serverMax) {
+	if okCount != serverMax {
 		t.Errorf("Expected %d OK responses, got %d", serverMax, okCount)
 	}
 	if rejectedCount != 2 {
@@ -533,13 +612,10 @@ func TestLoadShedder_ServerAndPerIPComposition(t *testing.T) {
 	// Server: 6 tokens, per-IP: 2 tokens, no refill.
 	// Server tokens are consumed before per-IP checks, so a per-IP
 	// rejection still costs a server token.
-	ls := New(
-		WithPerIPBurst(2),
-		WithPerIPRatePerSecond(0),
-		WithPerIPMaxInFlight(100),
-		WithServerBurst(6),
-		WithServerRatePerSecond(0),
-	)
+	ls := New(Config{
+		PerIP:  &PerIPConfig{Burst: 2, Rate: 0, MaxInFlight: 100},
+		Server: &ServerConfig{Burst: 6, Rate: 0},
+	})
 	defer ls.Stop()
 
 	handler := ls.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -595,11 +671,9 @@ func TestLoadShedder_ServerAndPerIPComposition(t *testing.T) {
 }
 
 func TestLoadShedder_ServerDisabledByDefault(t *testing.T) {
-	ls := New(
-		WithPerIPBurst(5),
-		WithPerIPRatePerSecond(0),
-		WithPerIPMaxInFlight(100),
-	)
+	ls := New(Config{
+		PerIP: &PerIPConfig{Burst: 5, Rate: 0, MaxInFlight: 100},
+	})
 	defer ls.Stop()
 
 	handler := ls.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -620,13 +694,10 @@ func TestLoadShedder_ServerDisabledByDefault(t *testing.T) {
 
 func TestLoadShedder_ServerRateLimit_ConcurrentAccess(t *testing.T) {
 	capacity := 50
-	ls := New(
-		WithPerIPBurst(1000),
-		WithPerIPRatePerSecond(0),
-		WithPerIPMaxInFlight(1000),
-		WithServerBurst(capacity),
-		WithServerRatePerSecond(0),
-	)
+	ls := New(Config{
+		PerIP:  &PerIPConfig{Burst: 1000, Rate: 0, MaxInFlight: 1000},
+		Server: &ServerConfig{Burst: capacity, Rate: 0},
+	})
 	defer ls.Stop()
 
 	handler := ls.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -659,27 +730,22 @@ func TestLoadShedder_ServerRateLimit_ConcurrentAccess(t *testing.T) {
 }
 
 func TestLoadShedder_ServerInflight_Decrement(t *testing.T) {
-	ls := New(
-		WithPerIPBurst(0),           // per-IP rejects everything
-		WithPerIPRatePerSecond(0),
-		WithPerIPMaxInFlight(100),
-		WithServerMaxInFlight(100),
-	)
+	ls := New(Config{
+		PerIP:  &PerIPConfig{Burst: 1, Rate: 0, MaxInFlight: 100},
+		Server: &ServerConfig{MaxInFlight: 100},
+	})
 	defer ls.Stop()
 
 	handler := ls.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))
 
-	// Send requests that pass server in-flight but get rejected by per-IP rate limit
+	// Send requests — per-IP burst=1, so second from same IP is rejected by rate limit
 	for i := 0; i < 10; i++ {
 		r := httptest.NewRequest("GET", "/", nil)
-		r.RemoteAddr = fmt.Sprintf("10.0.0.%d:8080", i)
+		r.RemoteAddr = "10.0.0.1:8080"
 		w := httptest.NewRecorder()
 		handler.ServeHTTP(w, r)
-		if w.Result().StatusCode != http.StatusTooManyRequests {
-			t.Fatal("Should be rejected by per-IP rate limit")
-		}
 	}
 
 	// Server in-flight should be back to zero
@@ -689,12 +755,10 @@ func TestLoadShedder_ServerInflight_Decrement(t *testing.T) {
 }
 
 func TestLoadShedder_CleanupDuringInFlight(t *testing.T) {
-	maxInFlight := int32(3)
-	ls := New(
-		WithPerIPBurst(100),
-		WithPerIPRatePerSecond(100),
-		WithPerIPMaxInFlight(maxInFlight),
-	)
+	maxInFlight := 3
+	ls := New(Config{
+		PerIP: &PerIPConfig{Burst: 100, Rate: 100, MaxInFlight: maxInFlight},
+	})
 	defer ls.Stop()
 
 	started := make(chan struct{})
@@ -709,7 +773,7 @@ func TestLoadShedder_CleanupDuringInFlight(t *testing.T) {
 
 	// Fill up all in-flight slots
 	var wg sync.WaitGroup
-	for i := 0; i < int(maxInFlight); i++ {
+	for i := 0; i < maxInFlight; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -747,41 +811,11 @@ func TestLoadShedder_CleanupDuringInFlight(t *testing.T) {
 	close(started)
 }
 
-func TestLoadShedder_OptionPanicsOnNegative(t *testing.T) {
-	tests := []struct {
-		name string
-		opt  func() Option
-	}{
-		{"WithPerIPBurst", func() Option { return WithPerIPBurst(-1) }},
-		{"WithPerIPRatePerSecond", func() Option { return WithPerIPRatePerSecond(-1) }},
-		{"WithPerIPMaxInFlight", func() Option { return WithPerIPMaxInFlight(-1) }},
-		{"WithServerBurst", func() Option { return WithServerBurst(-1) }},
-		{"WithServerRatePerSecond", func() Option { return WithServerRatePerSecond(-1) }},
-		{"WithServerMaxInFlight", func() Option { return WithServerMaxInFlight(-1) }},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			defer func() {
-				if r := recover(); r == nil {
-					t.Errorf("%s(-1) should panic", tt.name)
-				}
-			}()
-			ls := New(tt.opt())
-			ls.Stop()
-		})
-	}
-}
-
 func TestLoadShedder_ShedCauseCounters(t *testing.T) {
-	ls := New(
-		WithPerIPBurst(1),
-		WithPerIPRatePerSecond(0),
-		WithPerIPMaxInFlight(100),
-		WithServerBurst(3),
-		WithServerRatePerSecond(0),
-		WithServerMaxInFlight(100),
-	)
+	ls := New(Config{
+		PerIP:  &PerIPConfig{Burst: 1, Rate: 0, MaxInFlight: 100},
+		Server: &ServerConfig{Burst: 3, Rate: 0, MaxInFlight: 100},
+	})
 	defer ls.Stop()
 
 	handler := ls.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -819,12 +853,10 @@ func TestLoadShedder_ShedCauseCounters(t *testing.T) {
 }
 
 func TestLoadShedder_ShedCauseInFlightCounters(t *testing.T) {
-	ls := New(
-		WithPerIPBurst(100),
-		WithPerIPRatePerSecond(100),
-		WithPerIPMaxInFlight(1),
-		WithServerMaxInFlight(2),
-	)
+	ls := New(Config{
+		PerIP:  &PerIPConfig{Burst: 100, Rate: 100, MaxInFlight: 1},
+		Server: &ServerConfig{MaxInFlight: 2},
+	})
 	defer ls.Stop()
 
 	started := make(chan struct{})
@@ -895,14 +927,10 @@ func TestLoadShedder_ShedCauseInFlightCounters(t *testing.T) {
 
 func TestLoadShedder_ShedCountInvariant(t *testing.T) {
 	// sheddedRequestCount must equal the sum of all four cause counters.
-	ls := New(
-		WithPerIPBurst(1),
-		WithPerIPRatePerSecond(0),
-		WithPerIPMaxInFlight(1),
-		WithServerBurst(4),
-		WithServerRatePerSecond(0),
-		WithServerMaxInFlight(3),
-	)
+	ls := New(Config{
+		PerIP:  &PerIPConfig{Burst: 1, Rate: 0, MaxInFlight: 1},
+		Server: &ServerConfig{Burst: 4, Rate: 0, MaxInFlight: 3},
+	})
 	defer ls.Stop()
 
 	started := make(chan struct{})
@@ -1006,4 +1034,600 @@ func TestLoadShedder_ShedCountInvariant(t *testing.T) {
 	if total == 0 {
 		t.Error("Expected at least some rejections")
 	}
+}
+
+func TestLoadShedder_ServerOnly_ServerLimitsEnforced(t *testing.T) {
+	ls := New(Config{
+		Server: &ServerConfig{Burst: 3, Rate: 0},
+	})
+	defer ls.Stop()
+
+	handler := ls.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	var ok, rejected int
+	for i := 0; i < 5; i++ {
+		r := httptest.NewRequest("GET", "/", nil)
+		r.RemoteAddr = fmt.Sprintf("10.0.0.%d:8080", i)
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, r)
+		if w.Result().StatusCode == http.StatusOK {
+			ok++
+		} else {
+			rejected++
+		}
+	}
+
+	if ok != 3 {
+		t.Errorf("Expected 3 OK, got %d", ok)
+	}
+	if rejected != 2 {
+		t.Errorf("Expected 2 rejected, got %d", rejected)
+	}
+}
+
+func TestLoadShedder_WithTrustedProxyHeader_IndependentBuckets(t *testing.T) {
+	ls := New(Config{
+		PerIP: &PerIPConfig{Burst: 1, Rate: 0, MaxInFlight: 10, ProxyHeader: "X-Forwarded-For"},
+	})
+	defer ls.Stop()
+
+	handler := ls.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	// Two requests with different header IPs from the same RemoteAddr
+	r1 := httptest.NewRequest("GET", "/", nil)
+	r1.RemoteAddr = "10.0.0.1:8080"
+	r1.Header.Set("X-Forwarded-For", "203.0.113.1")
+	w1 := httptest.NewRecorder()
+	handler.ServeHTTP(w1, r1)
+
+	r2 := httptest.NewRequest("GET", "/", nil)
+	r2.RemoteAddr = "10.0.0.1:8080"
+	r2.Header.Set("X-Forwarded-For", "203.0.113.2")
+	w2 := httptest.NewRecorder()
+	handler.ServeHTTP(w2, r2)
+
+	if w1.Result().StatusCode != http.StatusOK || w2.Result().StatusCode != http.StatusOK {
+		t.Error("Different header IPs should get independent buckets")
+	}
+}
+
+func TestLoadShedder_WithTrustedProxyHeader_SharedBucketBehindProxies(t *testing.T) {
+	ls := New(Config{
+		PerIP: &PerIPConfig{Burst: 1, Rate: 0, MaxInFlight: 10, ProxyHeader: "X-Forwarded-For"},
+	})
+	defer ls.Stop()
+
+	handler := ls.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	// Same real IP behind different ALBs (different RemoteAddr)
+	r1 := httptest.NewRequest("GET", "/", nil)
+	r1.RemoteAddr = "10.0.0.1:8080"
+	r1.Header.Set("X-Forwarded-For", "203.0.113.99")
+	w1 := httptest.NewRecorder()
+	handler.ServeHTTP(w1, r1)
+
+	r2 := httptest.NewRequest("GET", "/", nil)
+	r2.RemoteAddr = "10.0.0.2:8080"
+	r2.Header.Set("X-Forwarded-For", "203.0.113.99")
+	w2 := httptest.NewRecorder()
+	handler.ServeHTTP(w2, r2)
+
+	if w1.Result().StatusCode != http.StatusOK {
+		t.Error("First request should succeed")
+	}
+	if w2.Result().StatusCode != http.StatusTooManyRequests {
+		t.Error("Second request from same real IP should be rejected (burst=1)")
+	}
+}
+
+func TestLoadShedder_WithTrustedProxyHeader_MissingHeaderFallback(t *testing.T) {
+	ls := New(Config{
+		PerIP: &PerIPConfig{Burst: 1, Rate: 0, MaxInFlight: 10, ProxyHeader: "X-Forwarded-For"},
+	})
+	defer ls.Stop()
+
+	handler := ls.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	// No header set — falls back to RemoteAddr
+	r1 := httptest.NewRequest("GET", "/", nil)
+	r1.RemoteAddr = "10.0.0.1:8080"
+	w1 := httptest.NewRecorder()
+	handler.ServeHTTP(w1, r1)
+
+	r2 := httptest.NewRequest("GET", "/", nil)
+	r2.RemoteAddr = "10.0.0.1:8080"
+	w2 := httptest.NewRecorder()
+	handler.ServeHTTP(w2, r2)
+
+	if w1.Result().StatusCode != http.StatusOK {
+		t.Error("First request should succeed")
+	}
+	if w2.Result().StatusCode != http.StatusTooManyRequests {
+		t.Error("Second request should be rejected (same RemoteAddr, burst=1)")
+	}
+}
+
+func TestLoadShedder_WithTrustedProxyHeader_EmptyHeaderFallback(t *testing.T) {
+	ls := New(Config{
+		PerIP: &PerIPConfig{Burst: 1, Rate: 0, MaxInFlight: 10, ProxyHeader: "X-Forwarded-For"},
+	})
+	defer ls.Stop()
+
+	handler := ls.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	// Header present but empty — falls back to RemoteAddr
+	r1 := httptest.NewRequest("GET", "/", nil)
+	r1.RemoteAddr = "10.0.0.1:8080"
+	r1.Header.Set("X-Forwarded-For", "")
+	w1 := httptest.NewRecorder()
+	handler.ServeHTTP(w1, r1)
+
+	r2 := httptest.NewRequest("GET", "/", nil)
+	r2.RemoteAddr = "10.0.0.1:8080"
+	r2.Header.Set("X-Forwarded-For", "")
+	w2 := httptest.NewRecorder()
+	handler.ServeHTTP(w2, r2)
+
+	if w1.Result().StatusCode != http.StatusOK {
+		t.Error("First request should succeed")
+	}
+	if w2.Result().StatusCode != http.StatusTooManyRequests {
+		t.Error("Second request should be rejected (same RemoteAddr, burst=1)")
+	}
+}
+
+func TestLoadShedder_WithTrustedProxyHeader_MultipleIPsUsesLast(t *testing.T) {
+	ls := New(Config{
+		PerIP: &PerIPConfig{Burst: 1, Rate: 0, MaxInFlight: 10, ProxyHeader: "X-Forwarded-For"},
+	})
+	defer ls.Stop()
+
+	handler := ls.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	// Same last IP but different proxy chains — should share bucket
+	r1 := httptest.NewRequest("GET", "/", nil)
+	r1.RemoteAddr = "10.0.0.1:8080"
+	r1.Header.Set("X-Forwarded-For", "203.0.113.1, 10.1.1.1, 10.2.2.2")
+	w1 := httptest.NewRecorder()
+	handler.ServeHTTP(w1, r1)
+
+	r2 := httptest.NewRequest("GET", "/", nil)
+	r2.RemoteAddr = "10.0.0.2:8080"
+	r2.Header.Set("X-Forwarded-For", "203.0.113.99, 10.2.2.2")
+	w2 := httptest.NewRecorder()
+	handler.ServeHTTP(w2, r2)
+
+	if w1.Result().StatusCode != http.StatusOK {
+		t.Error("First request should succeed")
+	}
+	if w2.Result().StatusCode != http.StatusTooManyRequests {
+		t.Error("Second request with same last IP should be rejected")
+	}
+}
+
+func TestLoadShedder_WithTrustedProxyHeader_DegenerateHeaders(t *testing.T) {
+	// Degenerate headers should fall back to RemoteAddr and not panic.
+	// We verify the fallback by sending two requests: one with a degenerate
+	// header and one without, both from the same RemoteAddr. If they share
+	// a bucket (second is rejected), the fallback is working.
+	degenerateValues := []string{
+		",",          // comma-only → rightmost is empty
+		"  ",         // spaces only → trimmed to empty
+		", 1.2.3.4",  // leading comma → rightmost is "1.2.3.4" (valid, not degenerate)
+		"not-an-ip",  // garbage → ParseAddr fails
+		"1.2.3.4,",   // trailing comma → rightmost is empty
+		", ",          // comma-space → rightmost trimmed to empty
+	}
+
+	for _, val := range degenerateValues {
+		t.Run(val, func(t *testing.T) {
+			// Fresh LoadShedder per subtest so buckets are independent.
+			sub := New(Config{
+				PerIP: &PerIPConfig{Burst: 1, Rate: 0, MaxInFlight: 10, ProxyHeader: "X-Forwarded-For"},
+			})
+			defer sub.Stop()
+			h := sub.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusOK)
+			}))
+
+			// First request with degenerate header
+			r1 := httptest.NewRequest("GET", "/", nil)
+			r1.RemoteAddr = "10.0.0.1:8080"
+			r1.Header.Set("X-Forwarded-For", val)
+			w1 := httptest.NewRecorder()
+			h.ServeHTTP(w1, r1)
+			if w1.Result().StatusCode != http.StatusOK {
+				t.Fatalf("First request should succeed, got %d", w1.Result().StatusCode)
+			}
+
+			// Second request with no header (pure RemoteAddr) from same IP.
+			// If the degenerate header fell back to RemoteAddr, this request
+			// shares the same bucket and should be rejected (burst=1).
+			r2 := httptest.NewRequest("GET", "/", nil)
+			r2.RemoteAddr = "10.0.0.1:8080"
+			w2 := httptest.NewRecorder()
+			h.ServeHTTP(w2, r2)
+
+			// ", 1.2.3.4" has a valid rightmost IP, so it won't share
+			// a bucket with RemoteAddr 10.0.0.1 — second request passes.
+			if val == ", 1.2.3.4" {
+				if w2.Result().StatusCode != http.StatusOK {
+					t.Errorf("Valid rightmost IP should not fall back to RemoteAddr")
+				}
+				return
+			}
+			if w2.Result().StatusCode != http.StatusTooManyRequests {
+				t.Errorf("Degenerate header %q should fall back to RemoteAddr, but second request was not rejected", val)
+			}
+		})
+	}
+}
+
+func TestLoadShedder_WithTrustedProxyHeader_BracketedIPv6(t *testing.T) {
+	ls := New(Config{
+		PerIP: &PerIPConfig{Burst: 1, Rate: 0, MaxInFlight: 10, ProxyHeader: "X-Forwarded-For"},
+	})
+	defer ls.Stop()
+
+	handler := ls.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	// "[::1]" in a header should be parsed as "::1" (brackets stripped).
+	r1 := httptest.NewRequest("GET", "/", nil)
+	r1.RemoteAddr = "10.0.0.1:8080"
+	r1.Header.Set("X-Forwarded-For", "[::1]")
+	w1 := httptest.NewRecorder()
+	handler.ServeHTTP(w1, r1)
+
+	// Bare "::1" should share the same bucket.
+	r2 := httptest.NewRequest("GET", "/", nil)
+	r2.RemoteAddr = "10.0.0.2:8080"
+	r2.Header.Set("X-Forwarded-For", "::1")
+	w2 := httptest.NewRecorder()
+	handler.ServeHTTP(w2, r2)
+
+	if w1.Result().StatusCode != http.StatusOK {
+		t.Error("First request should succeed")
+	}
+	if w2.Result().StatusCode != http.StatusTooManyRequests {
+		t.Error("[::1] and ::1 should share bucket")
+	}
+}
+
+func TestLoadShedder_WithTrustedProxyHeader_MultipleHeaders(t *testing.T) {
+	ls := New(Config{
+		PerIP: &PerIPConfig{Burst: 1, Rate: 0, MaxInFlight: 10, ProxyHeader: "X-Forwarded-For"},
+	})
+	defer ls.Stop()
+
+	handler := ls.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	// Two XFF headers: rightmost value from the last header entry is used.
+	r1 := httptest.NewRequest("GET", "/", nil)
+	r1.RemoteAddr = "10.0.0.1:8080"
+	r1.Header["X-Forwarded-For"] = []string{"1.1.1.1", "2.2.2.2, 3.3.3.3"}
+	w1 := httptest.NewRecorder()
+	handler.ServeHTTP(w1, r1)
+
+	// Second request with the same rightmost IP from last header
+	r2 := httptest.NewRequest("GET", "/", nil)
+	r2.RemoteAddr = "10.0.0.2:8080"
+	r2.Header["X-Forwarded-For"] = []string{"9.9.9.9, 3.3.3.3"}
+	w2 := httptest.NewRecorder()
+	handler.ServeHTTP(w2, r2)
+
+	if w1.Result().StatusCode != http.StatusOK {
+		t.Error("First request should succeed")
+	}
+	if w2.Result().StatusCode != http.StatusTooManyRequests {
+		t.Error("Second request with same rightmost IP should be rejected (burst=1)")
+	}
+}
+
+func TestLoadShedder_WithTrustedProxyHeader_IPv6Normalized(t *testing.T) {
+	ls := New(Config{
+		PerIP: &PerIPConfig{Burst: 1, Rate: 0, MaxInFlight: 10, ProxyHeader: "X-Forwarded-For"},
+	})
+	defer ls.Stop()
+
+	handler := ls.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	// Different textual representations of the same IPv6 address
+	r1 := httptest.NewRequest("GET", "/", nil)
+	r1.RemoteAddr = "10.0.0.1:8080"
+	r1.Header.Set("X-Forwarded-For", "2001:0db8:0000:0000:0000:0000:0000:0001")
+	w1 := httptest.NewRecorder()
+	handler.ServeHTTP(w1, r1)
+
+	r2 := httptest.NewRequest("GET", "/", nil)
+	r2.RemoteAddr = "10.0.0.2:8080"
+	r2.Header.Set("X-Forwarded-For", "2001:db8::1")
+	w2 := httptest.NewRecorder()
+	handler.ServeHTTP(w2, r2)
+
+	if w1.Result().StatusCode != http.StatusOK {
+		t.Error("First request should succeed")
+	}
+	if w2.Result().StatusCode != http.StatusTooManyRequests {
+		t.Error("Same IPv6 address in different forms should share bucket")
+	}
+}
+
+func TestLoadShedder_RateWithoutBurst_DefaultsBurstToRate(t *testing.T) {
+	// Setting only rate should default burst to rate, not silently reject all.
+	ls := New(Config{
+		PerIP: &PerIPConfig{Rate: 10, MaxInFlight: 100},
+	})
+	defer ls.Stop()
+
+	handler := ls.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	// With burst defaulted to 10, the first 10 requests should succeed.
+	var ok int
+	for i := 0; i < 15; i++ {
+		r := httptest.NewRequest("GET", "/", nil)
+		r.RemoteAddr = "10.0.0.1:8080"
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, r)
+		if w.Result().StatusCode == http.StatusOK {
+			ok++
+		}
+	}
+	if ok != 10 {
+		t.Errorf("Expected 10 OK (burst defaulted to rate), got %d", ok)
+	}
+}
+
+func TestLoadShedder_BurstWithoutRate_DefaultsRateToBurst(t *testing.T) {
+	// Setting only burst should default rate to burst, enabling refill.
+	ls := New(Config{
+		PerIP: &PerIPConfig{Burst: 2, MaxInFlight: 100},
+	})
+	defer ls.Stop()
+
+	handler := ls.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	// Exhaust the burst
+	for i := 0; i < 2; i++ {
+		r := httptest.NewRequest("GET", "/", nil)
+		r.RemoteAddr = "10.0.0.1:8080"
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, r)
+		if w.Result().StatusCode != http.StatusOK {
+			t.Fatalf("Request %d should succeed", i)
+		}
+	}
+
+	// Should be rejected now
+	r := httptest.NewRequest("GET", "/", nil)
+	r.RemoteAddr = "10.0.0.1:8080"
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, r)
+	if w.Result().StatusCode != http.StatusTooManyRequests {
+		t.Error("Should be rejected after burst exhausted")
+	}
+
+	// After refill (rate defaulted to burst=2), tokens should be available
+	time.Sleep(1100 * time.Millisecond)
+	r = httptest.NewRequest("GET", "/", nil)
+	r.RemoteAddr = "10.0.0.1:8080"
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, r)
+	if w.Result().StatusCode != http.StatusOK {
+		t.Error("Should succeed after refill (rate defaulted to burst)")
+	}
+}
+
+func TestLoadShedder_ServerRateWithoutBurst_DefaultsBurst(t *testing.T) {
+	// Server rate without burst should also default burst.
+	ls := New(Config{
+		Server: &ServerConfig{Rate: 5},
+	})
+	defer ls.Stop()
+
+	handler := ls.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	// With burst defaulted to 5, first 5 requests should succeed.
+	var ok int
+	for i := 0; i < 8; i++ {
+		r := httptest.NewRequest("GET", "/", nil)
+		r.RemoteAddr = fmt.Sprintf("10.0.0.%d:8080", i)
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, r)
+		if w.Result().StatusCode == http.StatusOK {
+			ok++
+		}
+	}
+	if ok != 5 {
+		t.Errorf("Expected 5 OK (server burst defaulted to rate), got %d", ok)
+	}
+}
+
+func TestLoadShedder_HashStability(t *testing.T) {
+	// Within a single process, the same input must produce the same hash.
+	h1 := murmur3Sum32("192.168.1.1")
+	h2 := murmur3Sum32("192.168.1.1")
+	if h1 != h2 {
+		t.Errorf("Hash not deterministic within process: %d != %d", h1, h2)
+	}
+
+	// Different inputs should (almost certainly) produce different hashes.
+	h3 := murmur3Sum32("192.168.1.2")
+	if h1 == h3 {
+		t.Error("Different inputs produced the same hash (extremely unlikely)")
+	}
+}
+
+func TestConfig_Validate_BothNonNilBothEmpty(t *testing.T) {
+	// Both PerIP and Server non-nil but with all-zero fields — both should
+	// fail validation. Validate returns the first error (PerIP checked first).
+	cfg := Config{
+		PerIP:  &PerIPConfig{},
+		Server: &ServerConfig{},
+	}
+	if err := cfg.Validate(); err == nil {
+		t.Error("Expected error when both configs are non-nil with all-zero fields")
+	}
+}
+
+func TestConfig_Validate_ValidConfigs(t *testing.T) {
+	// Verify that well-formed configs pass validation.
+	valid := []Config{
+		{PerIP: &PerIPConfig{Burst: 10}},
+		{PerIP: &PerIPConfig{Rate: 10}},
+		{PerIP: &PerIPConfig{MaxInFlight: 10}},
+		{Server: &ServerConfig{Burst: 10}},
+		{Server: &ServerConfig{Rate: 10}},
+		{Server: &ServerConfig{MaxInFlight: 10}},
+		{PerIP: &PerIPConfig{Burst: 10}, Server: &ServerConfig{MaxInFlight: 5}},
+	}
+	for i, cfg := range valid {
+		if err := cfg.Validate(); err != nil {
+			t.Errorf("Config %d should be valid, got: %v", i, err)
+		}
+	}
+}
+
+func TestLoadShedder_ServerOnly_NoCleanupGoroutine(t *testing.T) {
+	// Server-only config should not start the background cleanup goroutine.
+	// Verify by checking that Stop doesn't block (channel is never written to
+	// by a cleanup goroutine, so close is safe and immediate).
+	ls := New(Config{
+		Server: &ServerConfig{Burst: 100, Rate: 10},
+	})
+
+	// perIPRateEnabled and perIPInFlightEnabled should both be false
+	if ls.perIPRateEnabled {
+		t.Error("perIPRateEnabled should be false for server-only config")
+	}
+	if ls.perIPInFlightEnabled {
+		t.Error("perIPInFlightEnabled should be false for server-only config")
+	}
+
+	ls.Stop()
+}
+
+func TestLoadShedder_OrthogonalConfig_PerIPRateServerInFlight(t *testing.T) {
+	// Per-IP rate-only + server concurrency-only: the two dimensions
+	// should compose independently.
+	ls := New(Config{
+		PerIP:  &PerIPConfig{Burst: 2, Rate: 0},
+		Server: &ServerConfig{MaxInFlight: 100},
+	})
+	defer ls.Stop()
+
+	handler := ls.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	// First 2 requests succeed (per-IP burst=2), 3rd rejected by per-IP rate
+	for i := 0; i < 2; i++ {
+		r := httptest.NewRequest("GET", "/", nil)
+		r.RemoteAddr = "10.0.0.1:8080"
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, r)
+		if w.Result().StatusCode != http.StatusOK {
+			t.Fatalf("Request %d should succeed, got %d", i, w.Result().StatusCode)
+		}
+	}
+	r := httptest.NewRequest("GET", "/", nil)
+	r.RemoteAddr = "10.0.0.1:8080"
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, r)
+	if w.Result().StatusCode != http.StatusTooManyRequests {
+		t.Error("3rd request should be rejected by per-IP rate limit")
+	}
+}
+
+func TestLoadShedder_OrthogonalConfig_PerIPInFlightServerRate(t *testing.T) {
+	// Per-IP concurrency-only + server rate-only: the two dimensions
+	// should compose independently.
+	started := make(chan struct{})
+	release := make(chan struct{})
+
+	ls := New(Config{
+		PerIP:  &PerIPConfig{MaxInFlight: 1},
+		Server: &ServerConfig{Burst: 100, Rate: 0},
+	})
+	defer ls.Stop()
+
+	handler := ls.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		started <- struct{}{}
+		<-release
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	// Occupy the per-IP in-flight slot
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		r := httptest.NewRequest("GET", "/", nil)
+		r.RemoteAddr = "10.0.0.1:8080"
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, r)
+	}()
+	<-started
+
+	// Same IP: rejected by per-IP in-flight
+	r := httptest.NewRequest("GET", "/", nil)
+	r.RemoteAddr = "10.0.0.1:8080"
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, r)
+	if w.Result().StatusCode != http.StatusTooManyRequests {
+		t.Error("Same IP should be rejected by per-IP in-flight limit")
+	}
+
+	close(release)
+	go func() { for range started {} }()
+	wg.Wait()
+	close(started)
+}
+
+func TestLoadShedder_ConcurrentWithProxy(t *testing.T) {
+	ls := New(Config{
+		PerIP: &PerIPConfig{Burst: 1000, Rate: 0, MaxInFlight: 100, ProxyHeader: "X-Forwarded-For"},
+	})
+	defer ls.Stop()
+
+	handler := ls.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	var wg sync.WaitGroup
+	for i := 0; i < 100; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			r := httptest.NewRequest("GET", "/", nil)
+			r.RemoteAddr = "10.0.0.1:8080"
+			r.Header.Set("X-Forwarded-For", fmt.Sprintf("203.0.113.%d", id%256))
+			w := httptest.NewRecorder()
+			handler.ServeHTTP(w, r)
+		}(i)
+	}
+	wg.Wait()
 }

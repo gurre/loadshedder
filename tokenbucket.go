@@ -9,6 +9,11 @@ import (
 // coarseNow holds a cached nanosecond timestamp updated every 100ms by a
 // background goroutine. Reading this (~1ns atomic load) replaces per-call
 // time.Now() (~25ns vDSO) on the hot path.
+//
+// This is a process-lifetime singleton: the goroutine runs until the process
+// exits. It is started once by the first NewTokenBucket call and cannot be
+// stopped. This is deliberate — the cost is one goroutine and one 100ms
+// ticker for the entire process, shared by all TokenBucket instances.
 var coarseNow atomic.Int64
 var coarseClockOnce sync.Once
 
@@ -104,15 +109,23 @@ func (tb *TokenBucket) refill(now int64) {
 			return
 		}
 
-		currentTokens := atomic.LoadInt64(&tb.tokens)
-		newTokens := minInt64(currentTokens+refillTokens, tb.maxTokens)
-
-		// Double CAS: first update tokens, then advance the timestamp.
-		// If either fails, another goroutine raced us — retry from the
-		// top with a fresh read of lastRefill.
-		if atomic.CompareAndSwapInt64(&tb.tokens, currentTokens, newTokens) &&
-			atomic.CompareAndSwapInt64(&tb.lastRefillTimestampNano, lastRefill, now) {
-			return
+		// CAS the timestamp first to claim this refill window. Only one
+		// goroutine can win — losers retry and see the updated timestamp,
+		// computing zero elapsed seconds. If the timestamp CAS succeeds
+		// but the token CAS fails (concurrent takeToken changed the
+		// count), we retry the token CAS in a tight loop since we own
+		// the window. This avoids the old bug where a token CAS succeeded
+		// but the timestamp CAS failed, causing double-crediting.
+		if !atomic.CompareAndSwapInt64(&tb.lastRefillTimestampNano, lastRefill, now) {
+			continue
+		}
+		// We own this refill window. Update tokens with a CAS loop.
+		for {
+			currentTokens := atomic.LoadInt64(&tb.tokens)
+			newTokens := min(currentTokens+refillTokens, tb.maxTokens)
+			if atomic.CompareAndSwapInt64(&tb.tokens, currentTokens, newTokens) {
+				return
+			}
 		}
 	}
 }
@@ -132,10 +145,3 @@ func (tb *TokenBucket) takeToken() bool {
 	return false
 }
 
-func minInt64(a, b int64) int64 {
-	if a < b {
-		return a
-	}
-
-	return b
-}

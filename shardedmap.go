@@ -72,6 +72,18 @@ func (sm *shardedMap[V]) Delete(key uint32) {
 	s.mu.Unlock()
 }
 
+// DeleteIf removes the key only if pred returns true for the current value.
+// The predicate runs under the shard's write lock, ensuring no concurrent
+// modification between the check and the delete.
+func (sm *shardedMap[V]) DeleteIf(key uint32, pred func(V) bool) {
+	s := sm.getShard(key)
+	s.mu.Lock()
+	if v, ok := s.m[key]; ok && pred(v) {
+		delete(s.m, key)
+	}
+	s.mu.Unlock()
+}
+
 // Range calls f for each key-value pair. If f returns false, iteration stops.
 func (sm *shardedMap[V]) Range(f func(key uint32, value V) bool) {
 	for i := range sm.shards {
