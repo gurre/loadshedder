@@ -48,11 +48,16 @@ func init() {
 //   - When Burst is set without Rate (or vice versa), New defaults the missing
 //     value to the other: PerIPConfig{Rate: 10} becomes {Burst: 10, Rate: 10}.
 //
+// OnReject is optional and is not validated. When nil, rejections receive
+// a default text body with status 429; rate-limit rejections also include
+// a Retry-After: 1 header.
+//
 // Use Validate to check for errors, or pass directly to New which panics on
 // invalid config.
 type Config struct {
-	PerIP  *PerIPConfig  // nil = per-IP disabled
-	Server *ServerConfig // nil = no server-wide limits
+	PerIP    *PerIPConfig  // nil = per-IP disabled
+	Server   *ServerConfig // nil = no server-wide limits
+	OnReject RejectHandler // nil = default 429 text response
 }
 
 // PerIPConfig controls per-client rate and concurrency limits.
@@ -71,6 +76,49 @@ type ServerConfig struct {
 	Rate        int // tokens/sec refill server-wide (defaults to Burst if zero)
 	MaxInFlight int // max concurrent server-wide (0 = no concurrency limit); must be <= math.MaxInt32
 }
+
+// RejectReason identifies which limiter caused a request to be shed.
+// Values are stable; callers may switch on them to emit distinct error
+// codes, metric labels, or retry hints. The zero value is reserved and
+// stringifies as "unknown".
+type RejectReason uint8
+
+const (
+	// RejectServerInFlight indicates the server-wide concurrency cap was exceeded.
+	RejectServerInFlight RejectReason = iota + 1
+	// RejectServerRate indicates the server-wide token bucket was empty.
+	RejectServerRate
+	// RejectPerIPInFlight indicates the per-IP concurrency cap was exceeded.
+	RejectPerIPInFlight
+	// RejectPerIPRate indicates the per-IP token bucket was empty.
+	RejectPerIPRate
+)
+
+// String returns a stable lowercase name suitable for metric labels and logs.
+// Unknown or zero values stringify as "unknown" so printing never panics.
+func (r RejectReason) String() string {
+	switch r {
+	case RejectServerInFlight:
+		return "server_in_flight"
+	case RejectServerRate:
+		return "server_rate"
+	case RejectPerIPInFlight:
+		return "per_ip_in_flight"
+	case RejectPerIPRate:
+		return "per_ip_rate"
+	default:
+		return "unknown"
+	}
+}
+
+// RejectHandler writes the response body for a shed request. It must call
+// WriteHeader (or a helper that does so) before returning; loadshedder does
+// not write anything after invoking it. The handler may inspect r to vary
+// response shape per route, and reason to vary status, headers, or body.
+//
+// When nil on Config, loadshedder writes a default text/plain 429 response;
+// rate-limit rejections also include a Retry-After: 1 header.
+type RejectHandler func(w http.ResponseWriter, r *http.Request, reason RejectReason)
 
 // Validate checks that the Config is valid. Returns an error describing the
 // first problem found. Called by New, which panics on error.
@@ -161,6 +209,11 @@ type LoadShedder struct {
 	sheddedCauseServerInFlight int64
 	sheddedCauseServerRate     int64
 
+	// optional caller-supplied rejection writer — cold path; placed after
+	// the shedded counters so it never shares a cache line with the hot
+	// success-path fields above (serverInflight, *RateBucket pointers).
+	onReject RejectHandler
+
 	// cleanup management
 	cleanupOnce sync.Once
 	stopOnce    sync.Once
@@ -196,6 +249,7 @@ func New(cfg Config) *LoadShedder {
 		rateLimitBuckets: newShardedMap[*TokenBucket](),
 		inFlightBuckets:  newShardedMap[*int32](),
 		stopCleanup:      make(chan struct{}),
+		onReject:         cfg.OnReject,
 	}
 
 	if cfg.PerIP != nil {
@@ -250,6 +304,45 @@ func New(cfg Config) *LoadShedder {
 	return ls
 }
 
+// Reused across all default-mode rejections so each call avoids the per-request
+// allocations that http.Header.Set, fmt.Fprintln, or []byte(string) would do.
+// All values are immutable; never mutated after init.
+var (
+	retryAfterOneSecond = []string{"1"}
+	rejectBodyTooMany   = []byte("Too many simultaneous requests\n")
+	rejectBodyRate      = []byte("Rate limit exceeded\n")
+)
+
+// reject writes the response for a shed request. When the caller supplied
+// an OnReject handler, it owns the wire format entirely. Otherwise we emit
+// a text/plain 429 — equivalent to http.Error — with a Retry-After: 1 hint
+// on rate-limit rejections; in-flight rejections omit Retry-After because
+// we don't know when a slot will free.
+//
+// http.Error is inlined here so w.Header() is called exactly once. Some
+// ResponseWriters (notably the test fixture and any caller emulating a
+// discard writer) allocate a fresh header map on every Header() call;
+// inlining keeps the rejection path at one such allocation.
+func (ls *LoadShedder) reject(w http.ResponseWriter, r *http.Request, reason RejectReason) {
+	if ls.onReject != nil {
+		ls.onReject(w, r, reason)
+		return
+	}
+	h := w.Header()
+	h.Del("Content-Length")
+	h.Set("Content-Type", "text/plain; charset=utf-8")
+	h.Set("X-Content-Type-Options", "nosniff")
+	body := rejectBodyTooMany
+	if reason == RejectServerRate || reason == RejectPerIPRate {
+		body = rejectBodyRate
+		// Direct map assignment with a shared slice avoids the []string{"1"}
+		// allocation that h.Set would do; "Retry-After" is already canonical.
+		h["Retry-After"] = retryAfterOneSecond
+	}
+	w.WriteHeader(http.StatusTooManyRequests)
+	_, _ = w.Write(body)
+}
+
 // Handler returns middleware that guards next with rate and concurrency limits.
 //
 // For each request the middleware checks in order:
@@ -278,7 +371,7 @@ func (ls *LoadShedder) Handler(next http.Handler) http.Handler {
 				atomic.AddInt32(&ls.serverInflight, -1)
 				atomic.AddInt64(&ls.sheddedRequestCount, 1)
 				atomic.AddInt64(&ls.sheddedCauseServerInFlight, 1)
-				http.Error(w, "Too many simultaneous requests", http.StatusTooManyRequests)
+				ls.reject(w, r, RejectServerInFlight)
 				return
 			}
 			defer atomic.AddInt32(&ls.serverInflight, -1)
@@ -289,7 +382,7 @@ func (ls *LoadShedder) Handler(next http.Handler) http.Handler {
 			if !ls.serverRateBucket.TryTake() {
 				atomic.AddInt64(&ls.sheddedRequestCount, 1)
 				atomic.AddInt64(&ls.sheddedCauseServerRate, 1)
-				http.Error(w, "Rate limit exceeded", http.StatusTooManyRequests)
+				ls.reject(w, r, RejectServerRate)
 				return
 			}
 		}
@@ -315,7 +408,7 @@ func (ls *LoadShedder) Handler(next http.Handler) http.Handler {
 					atomic.AddInt32(inFlightPtr, -1)
 					atomic.AddInt64(&ls.sheddedRequestCount, 1)
 					atomic.AddInt64(&ls.sheddedCausePerIPInFlight, 1)
-					http.Error(w, "Too many simultaneous requests", http.StatusTooManyRequests)
+					ls.reject(w, r, RejectPerIPInFlight)
 					return
 				}
 				defer atomic.AddInt32(inFlightPtr, -1)
@@ -334,7 +427,7 @@ func (ls *LoadShedder) Handler(next http.Handler) http.Handler {
 				if !bucket.TryTake() {
 					atomic.AddInt64(&ls.sheddedRequestCount, 1)
 					atomic.AddInt64(&ls.sheddedCausePerIPRate, 1)
-					http.Error(w, "Rate limit exceeded", http.StatusTooManyRequests)
+					ls.reject(w, r, RejectPerIPRate)
 					return
 				}
 			}

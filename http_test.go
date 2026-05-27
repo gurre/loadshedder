@@ -6,6 +6,7 @@ import (
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -1630,4 +1631,637 @@ func TestLoadShedder_ConcurrentWithProxy(t *testing.T) {
 		}(i)
 	}
 	wg.Wait()
+}
+
+func TestRejectReason_String(t *testing.T) {
+	cases := []struct {
+		in   RejectReason
+		want string
+	}{
+		{RejectServerInFlight, "server_in_flight"},
+		{RejectServerRate, "server_rate"},
+		{RejectPerIPInFlight, "per_ip_in_flight"},
+		{RejectPerIPRate, "per_ip_rate"},
+		{RejectReason(0), "unknown"},
+		{RejectReason(5), "unknown"},
+		{RejectReason(255), "unknown"},
+	}
+	for _, tc := range cases {
+		if got := tc.in.String(); got != tc.want {
+			t.Errorf("RejectReason(%d).String() = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+// captureReject returns an OnReject handler that records the most recent
+// reason and writes 429 with no body. Used by tests that care about the
+// reason argument, not the wire output.
+func captureReject(dst *atomic.Value) RejectHandler {
+	return func(w http.ResponseWriter, r *http.Request, reason RejectReason) {
+		dst.Store(reason)
+		w.WriteHeader(http.StatusTooManyRequests)
+	}
+}
+
+func TestLoadShedder_OnReject_AllFourReasons(t *testing.T) {
+	t.Run("server_in_flight", func(t *testing.T) {
+		var captured atomic.Value
+		ls := New(Config{
+			PerIP:    &PerIPConfig{MaxInFlight: 100, Burst: 100, Rate: 100},
+			Server:   &ServerConfig{MaxInFlight: 1},
+			OnReject: captureReject(&captured),
+		})
+		defer ls.Stop()
+
+		started := make(chan struct{})
+		release := make(chan struct{})
+		h := ls.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			started <- struct{}{}
+			<-release
+			w.WriteHeader(http.StatusOK)
+		}))
+
+		var wg sync.WaitGroup
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			r := httptest.NewRequest("GET", "/", nil)
+			r.RemoteAddr = "10.0.0.1:8080"
+			h.ServeHTTP(httptest.NewRecorder(), r)
+		}()
+		<-started
+
+		r := httptest.NewRequest("GET", "/", nil)
+		r.RemoteAddr = "10.0.0.2:8080"
+		h.ServeHTTP(httptest.NewRecorder(), r)
+
+		close(release)
+		wg.Wait()
+
+		if got := captured.Load(); got != RejectServerInFlight {
+			t.Errorf("reason = %v, want RejectServerInFlight", got)
+		}
+	})
+
+	t.Run("server_rate", func(t *testing.T) {
+		var captured atomic.Value
+		ls := New(Config{
+			Server:   &ServerConfig{Burst: 1, Rate: 0},
+			OnReject: captureReject(&captured),
+		})
+		defer ls.Stop()
+
+		h := ls.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		}))
+
+		// Consume the token, then trigger a rate rejection.
+		for i := 0; i < 2; i++ {
+			r := httptest.NewRequest("GET", "/", nil)
+			r.RemoteAddr = fmt.Sprintf("10.0.0.%d:8080", i+1)
+			h.ServeHTTP(httptest.NewRecorder(), r)
+		}
+
+		if got := captured.Load(); got != RejectServerRate {
+			t.Errorf("reason = %v, want RejectServerRate", got)
+		}
+	})
+
+	t.Run("per_ip_in_flight", func(t *testing.T) {
+		var captured atomic.Value
+		ls := New(Config{
+			PerIP:    &PerIPConfig{MaxInFlight: 1, Burst: 100, Rate: 100},
+			OnReject: captureReject(&captured),
+		})
+		defer ls.Stop()
+
+		started := make(chan struct{})
+		release := make(chan struct{})
+		h := ls.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			started <- struct{}{}
+			<-release
+			w.WriteHeader(http.StatusOK)
+		}))
+
+		var wg sync.WaitGroup
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			r := httptest.NewRequest("GET", "/", nil)
+			r.RemoteAddr = "10.0.0.1:8080"
+			h.ServeHTTP(httptest.NewRecorder(), r)
+		}()
+		<-started
+
+		r := httptest.NewRequest("GET", "/", nil)
+		r.RemoteAddr = "10.0.0.1:8080" // same IP
+		h.ServeHTTP(httptest.NewRecorder(), r)
+
+		close(release)
+		wg.Wait()
+
+		if got := captured.Load(); got != RejectPerIPInFlight {
+			t.Errorf("reason = %v, want RejectPerIPInFlight", got)
+		}
+	})
+
+	t.Run("per_ip_rate", func(t *testing.T) {
+		var captured atomic.Value
+		ls := New(Config{
+			PerIP:    &PerIPConfig{Burst: 1, Rate: 0, MaxInFlight: 100},
+			OnReject: captureReject(&captured),
+		})
+		defer ls.Stop()
+
+		h := ls.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		}))
+
+		for i := 0; i < 2; i++ {
+			r := httptest.NewRequest("GET", "/", nil)
+			r.RemoteAddr = "10.0.0.1:8080"
+			h.ServeHTTP(httptest.NewRecorder(), r)
+		}
+
+		if got := captured.Load(); got != RejectPerIPRate {
+			t.Errorf("reason = %v, want RejectPerIPRate", got)
+		}
+	})
+}
+
+func TestLoadShedder_OnReject_CustomStatusAndBody(t *testing.T) {
+	// Callback owns status, headers, and body; loadshedder writes nothing else.
+	ls := New(Config{
+		PerIP: &PerIPConfig{Burst: 1, Rate: 0, MaxInFlight: 100},
+		OnReject: func(w http.ResponseWriter, r *http.Request, reason RejectReason) {
+			w.Header().Set("Retry-After", "5")
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte(`{"reason":"` + reason.String() + `"}`))
+		},
+	})
+	defer ls.Stop()
+
+	h := ls.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	// Consume token; next request triggers rejection.
+	for i := 0; i < 2; i++ {
+		r := httptest.NewRequest("GET", "/", nil)
+		r.RemoteAddr = "10.0.0.1:8080"
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, r)
+		if i == 0 {
+			continue
+		}
+		if w.Result().StatusCode != http.StatusServiceUnavailable {
+			t.Errorf("status = %d, want 503", w.Result().StatusCode)
+		}
+		if got := w.Result().Header.Get("Retry-After"); got != "5" {
+			t.Errorf("Retry-After = %q, want %q", got, "5")
+		}
+		if got := w.Result().Header.Get("Content-Type"); got != "application/json" {
+			t.Errorf("Content-Type = %q, want %q", got, "application/json")
+		}
+		want := `{"reason":"per_ip_rate"}`
+		if got := w.Body.String(); got != want {
+			t.Errorf("body = %q, want %q", got, want)
+		}
+	}
+}
+
+func TestLoadShedder_DefaultRejection_RateLimitSetsRetryAfter(t *testing.T) {
+	t.Run("server_rate", func(t *testing.T) {
+		ls := New(Config{Server: &ServerConfig{Burst: 1, Rate: 0}})
+		defer ls.Stop()
+		h := ls.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		}))
+
+		for i := 0; i < 2; i++ {
+			r := httptest.NewRequest("GET", "/", nil)
+			r.RemoteAddr = fmt.Sprintf("10.0.0.%d:8080", i+1)
+			w := httptest.NewRecorder()
+			h.ServeHTTP(w, r)
+			if i == 0 {
+				continue
+			}
+			if w.Result().StatusCode != http.StatusTooManyRequests {
+				t.Errorf("status = %d, want 429", w.Result().StatusCode)
+			}
+			if got := w.Result().Header.Get("Retry-After"); got != "1" {
+				t.Errorf("Retry-After = %q, want %q", got, "1")
+			}
+			if got := w.Body.String(); got != "Rate limit exceeded\n" {
+				t.Errorf("body = %q, want %q", got, "Rate limit exceeded\n")
+			}
+		}
+	})
+
+	t.Run("per_ip_rate", func(t *testing.T) {
+		ls := New(Config{PerIP: &PerIPConfig{Burst: 1, Rate: 0, MaxInFlight: 100}})
+		defer ls.Stop()
+		h := ls.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		}))
+
+		for i := 0; i < 2; i++ {
+			r := httptest.NewRequest("GET", "/", nil)
+			r.RemoteAddr = "10.0.0.1:8080"
+			w := httptest.NewRecorder()
+			h.ServeHTTP(w, r)
+			if i == 0 {
+				continue
+			}
+			if got := w.Result().Header.Get("Retry-After"); got != "1" {
+				t.Errorf("Retry-After = %q, want %q", got, "1")
+			}
+			if got := w.Body.String(); got != "Rate limit exceeded\n" {
+				t.Errorf("body = %q, want %q", got, "Rate limit exceeded\n")
+			}
+		}
+	})
+}
+
+func TestLoadShedder_DefaultRejection_InFlightOmitsRetryAfter(t *testing.T) {
+	t.Run("server_in_flight", func(t *testing.T) {
+		ls := New(Config{
+			PerIP:  &PerIPConfig{MaxInFlight: 100, Burst: 100, Rate: 100},
+			Server: &ServerConfig{MaxInFlight: 1},
+		})
+		defer ls.Stop()
+
+		started := make(chan struct{})
+		release := make(chan struct{})
+		h := ls.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			started <- struct{}{}
+			<-release
+			w.WriteHeader(http.StatusOK)
+		}))
+
+		var wg sync.WaitGroup
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			r := httptest.NewRequest("GET", "/", nil)
+			r.RemoteAddr = "10.0.0.1:8080"
+			h.ServeHTTP(httptest.NewRecorder(), r)
+		}()
+		<-started
+
+		r := httptest.NewRequest("GET", "/", nil)
+		r.RemoteAddr = "10.0.0.2:8080"
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, r)
+
+		close(release)
+		wg.Wait()
+
+		if w.Result().StatusCode != http.StatusTooManyRequests {
+			t.Errorf("status = %d, want 429", w.Result().StatusCode)
+		}
+		if got := w.Result().Header.Get("Retry-After"); got != "" {
+			t.Errorf("Retry-After = %q, want empty (in-flight has no useful hint)", got)
+		}
+		if got := w.Body.String(); got != "Too many simultaneous requests\n" {
+			t.Errorf("body = %q, want %q", got, "Too many simultaneous requests\n")
+		}
+	})
+
+	t.Run("per_ip_in_flight", func(t *testing.T) {
+		ls := New(Config{
+			PerIP: &PerIPConfig{MaxInFlight: 1, Burst: 100, Rate: 100},
+		})
+		defer ls.Stop()
+
+		started := make(chan struct{})
+		release := make(chan struct{})
+		h := ls.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			started <- struct{}{}
+			<-release
+			w.WriteHeader(http.StatusOK)
+		}))
+
+		var wg sync.WaitGroup
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			r := httptest.NewRequest("GET", "/", nil)
+			r.RemoteAddr = "10.0.0.1:8080"
+			h.ServeHTTP(httptest.NewRecorder(), r)
+		}()
+		<-started
+
+		r := httptest.NewRequest("GET", "/", nil)
+		r.RemoteAddr = "10.0.0.1:8080"
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, r)
+
+		close(release)
+		wg.Wait()
+
+		if got := w.Result().Header.Get("Retry-After"); got != "" {
+			t.Errorf("Retry-After = %q, want empty", got)
+		}
+		if got := w.Body.String(); got != "Too many simultaneous requests\n" {
+			t.Errorf("body = %q, want %q", got, "Too many simultaneous requests\n")
+		}
+	})
+}
+
+func TestLoadShedder_OnReject_CounterStillIncrements(t *testing.T) {
+	// Counter increments happen at the call site, before reject() is invoked;
+	// the callback writing nothing must not affect them.
+	ls := New(Config{
+		PerIP: &PerIPConfig{Burst: 1, Rate: 0, MaxInFlight: 100},
+		OnReject: func(w http.ResponseWriter, r *http.Request, reason RejectReason) {
+			// intentionally writes nothing
+		},
+	})
+	defer ls.Stop()
+
+	h := ls.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	for i := 0; i < 2; i++ {
+		r := httptest.NewRequest("GET", "/", nil)
+		r.RemoteAddr = "10.0.0.1:8080"
+		h.ServeHTTP(httptest.NewRecorder(), r)
+	}
+
+	if got := atomic.LoadInt64(&ls.sheddedCausePerIPRate); got != 1 {
+		t.Errorf("sheddedCausePerIPRate = %d, want 1", got)
+	}
+	if got := atomic.LoadInt64(&ls.sheddedRequestCount); got != 1 {
+		t.Errorf("sheddedRequestCount = %d, want 1", got)
+	}
+}
+
+func TestLoadShedder_OnReject_PanicReleasesInFlight(t *testing.T) {
+	// The increment-then-revert rollback at the rejection site happens BEFORE
+	// reject() is invoked. A panicking callback must not leak the in-flight
+	// slot — the counter must reflect only the still-running occupying request.
+	ls := New(Config{
+		PerIP:  &PerIPConfig{MaxInFlight: 100, Burst: 100, Rate: 100},
+		Server: &ServerConfig{MaxInFlight: 1},
+		OnReject: func(w http.ResponseWriter, r *http.Request, reason RejectReason) {
+			panic("simulated panic in OnReject")
+		},
+	})
+	defer ls.Stop()
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	h := ls.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		started <- struct{}{}
+		<-release
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		r := httptest.NewRequest("GET", "/", nil)
+		r.RemoteAddr = "10.0.0.1:8080"
+		h.ServeHTTP(httptest.NewRecorder(), r)
+	}()
+	<-started
+
+	// Trigger a server-in-flight rejection; the callback panics.
+	func() {
+		defer func() { _ = recover() }()
+		r := httptest.NewRequest("GET", "/", nil)
+		r.RemoteAddr = "10.0.0.2:8080"
+		h.ServeHTTP(httptest.NewRecorder(), r)
+	}()
+
+	// Slot count reflects only the goroutine still in the handler.
+	if v := atomic.LoadInt32(&ls.serverInflight); v != 1 {
+		t.Errorf("serverInflight = %d after panicking reject, want 1", v)
+	}
+
+	close(release)
+	wg.Wait()
+
+	if v := atomic.LoadInt32(&ls.serverInflight); v != 0 {
+		t.Errorf("serverInflight = %d after handler completed, want 0", v)
+	}
+}
+
+// TestLoadShedder_OnReject_PerIPInFlight_PanicReleasesSlot mirrors the
+// server-side panic test for the per-IP in-flight path. The per-IP counter
+// is decremented inline before reject() is invoked (http.go:315), so a panic
+// in the callback must not leak a slot in the per-IP map.
+func TestLoadShedder_OnReject_PerIPInFlight_PanicReleasesSlot(t *testing.T) {
+	ls := New(Config{
+		PerIP: &PerIPConfig{MaxInFlight: 1, Burst: 100, Rate: 100},
+		OnReject: func(w http.ResponseWriter, r *http.Request, reason RejectReason) {
+			panic("simulated panic in OnReject")
+		},
+	})
+	defer ls.Stop()
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	h := ls.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		started <- struct{}{}
+		<-release
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		r := httptest.NewRequest("GET", "/", nil)
+		r.RemoteAddr = "10.0.0.1:8080"
+		h.ServeHTTP(httptest.NewRecorder(), r)
+	}()
+	<-started
+
+	// Same IP triggers per-IP in-flight rejection; the callback panics.
+	func() {
+		defer func() { _ = recover() }()
+		r := httptest.NewRequest("GET", "/", nil)
+		r.RemoteAddr = "10.0.0.1:8080"
+		h.ServeHTTP(httptest.NewRecorder(), r)
+	}()
+
+	// Find the per-IP in-flight counter for this IP and verify it is 1
+	// (the still-running occupying request, not 2).
+	r := httptest.NewRequest("GET", "/", nil)
+	r.RemoteAddr = "10.0.0.1:8080"
+	key := bucketKeyIP(r, "")
+	inFlightPtr, ok := ls.inFlightBuckets.Load(key)
+	if !ok {
+		t.Fatal("per-IP in-flight bucket missing after rejection")
+	}
+	if v := atomic.LoadInt32(inFlightPtr); v != 1 {
+		t.Errorf("per-IP in-flight = %d after panicking reject, want 1", v)
+	}
+
+	close(release)
+	wg.Wait()
+
+	if v := atomic.LoadInt32(inFlightPtr); v != 0 {
+		t.Errorf("per-IP in-flight = %d after handler completed, want 0", v)
+	}
+}
+
+// TestLoadShedder_OnReject_HighConcurrency_NoRace fires N concurrent
+// requests where only one can succeed (server burst=1, rate=0). The remaining
+// N-1 must all hit RejectServerRate, the callback must be invoked exactly
+// N-1 times, and the run must be clean under -race.
+func TestLoadShedder_OnReject_HighConcurrency_NoRace(t *testing.T) {
+	const N = 200
+
+	var perReasonCount [6]atomic.Int64 // index by RejectReason value
+	ls := New(Config{
+		Server: &ServerConfig{Burst: 1, Rate: 0},
+		OnReject: func(w http.ResponseWriter, r *http.Request, reason RejectReason) {
+			perReasonCount[reason].Add(1)
+			w.WriteHeader(http.StatusTooManyRequests)
+		},
+	})
+	defer ls.Stop()
+
+	var successCount int64
+	h := ls.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt64(&successCount, 1)
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	var wg sync.WaitGroup
+	for i := 0; i < N; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			r := httptest.NewRequest("GET", "/", nil)
+			r.RemoteAddr = fmt.Sprintf("10.0.0.%d:8080", idx%256)
+			h.ServeHTTP(httptest.NewRecorder(), r)
+		}(i)
+	}
+	wg.Wait()
+
+	if got := atomic.LoadInt64(&successCount); got != 1 {
+		t.Errorf("successCount = %d, want 1", got)
+	}
+	if got := perReasonCount[RejectServerRate].Load(); got != N-1 {
+		t.Errorf("RejectServerRate callbacks = %d, want %d", got, N-1)
+	}
+	for r := RejectReason(0); r <= RejectReason(5); r++ {
+		if r == RejectServerRate {
+			continue
+		}
+		if got := perReasonCount[r].Load(); got != 0 {
+			t.Errorf("unexpected callbacks for reason %v: %d", r, got)
+		}
+	}
+}
+
+// TestLoadShedder_OnReject_OuterLayerWins verifies the documented check
+// order in http.go:255-260: server-wide checks run before per-IP. When both
+// would reject the same request, the server cause is reported.
+func TestLoadShedder_OnReject_OuterLayerWins(t *testing.T) {
+	// Server.Burst=1 + PerIP.Burst=1 with same IP: the first request consumes
+	// the server token AND the per-IP token. The second request from the same
+	// IP would be rejected by both layers — server rate wins.
+	var captured atomic.Value
+	ls := New(Config{
+		PerIP:    &PerIPConfig{Burst: 1, Rate: 0, MaxInFlight: 100},
+		Server:   &ServerConfig{Burst: 1, Rate: 0},
+		OnReject: captureReject(&captured),
+	})
+	defer ls.Stop()
+
+	h := ls.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	for i := 0; i < 2; i++ {
+		r := httptest.NewRequest("GET", "/", nil)
+		r.RemoteAddr = "10.0.0.1:8080"
+		h.ServeHTTP(httptest.NewRecorder(), r)
+	}
+
+	if got := captured.Load(); got != RejectServerRate {
+		t.Errorf("reason = %v, want RejectServerRate (server check runs first)", got)
+	}
+}
+
+// TestLoadShedder_OnReject_CallbackReceivesOriginalRequest verifies the
+// *http.Request reaches the callback unwrapped and unmutated — URL path,
+// headers, and RemoteAddr are preserved. Guards against future refactors
+// that might wrap the writer or rebuild the request.
+func TestLoadShedder_OnReject_CallbackReceivesOriginalRequest(t *testing.T) {
+	type snapshot struct {
+		method     string
+		path       string
+		remote     string
+		userAgent  string
+		customHdr  string
+		urlPointer *url.URL
+	}
+	var got snapshot
+
+	ls := New(Config{
+		PerIP: &PerIPConfig{Burst: 1, Rate: 0, MaxInFlight: 100},
+		OnReject: func(w http.ResponseWriter, r *http.Request, reason RejectReason) {
+			got = snapshot{
+				method:     r.Method,
+				path:       r.URL.Path,
+				remote:     r.RemoteAddr,
+				userAgent:  r.Header.Get("User-Agent"),
+				customHdr:  r.Header.Get("X-Trace-Id"),
+				urlPointer: r.URL,
+			}
+			w.WriteHeader(http.StatusTooManyRequests)
+		},
+	})
+	defer ls.Stop()
+
+	h := ls.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	// Consume the burst.
+	r1 := httptest.NewRequest("GET", "/", nil)
+	r1.RemoteAddr = "10.0.0.1:8080"
+	h.ServeHTTP(httptest.NewRecorder(), r1)
+
+	// This request triggers rejection.
+	want := snapshot{
+		method:    "POST",
+		path:      "/api/v1/items",
+		remote:    "10.0.0.1:8080",
+		userAgent: "edge-case-test/1.0",
+		customHdr: "trace-abc-123",
+	}
+	r2 := httptest.NewRequest(want.method, want.path, nil)
+	r2.RemoteAddr = want.remote
+	r2.Header.Set("User-Agent", want.userAgent)
+	r2.Header.Set("X-Trace-Id", want.customHdr)
+	h.ServeHTTP(httptest.NewRecorder(), r2)
+
+	if got.method != want.method {
+		t.Errorf("method = %q, want %q", got.method, want.method)
+	}
+	if got.path != want.path {
+		t.Errorf("path = %q, want %q", got.path, want.path)
+	}
+	if got.remote != want.remote {
+		t.Errorf("RemoteAddr = %q, want %q", got.remote, want.remote)
+	}
+	if got.userAgent != want.userAgent {
+		t.Errorf("User-Agent = %q, want %q", got.userAgent, want.userAgent)
+	}
+	if got.customHdr != want.customHdr {
+		t.Errorf("X-Trace-Id = %q, want %q", got.customHdr, want.customHdr)
+	}
+	if got.urlPointer != r2.URL {
+		t.Errorf("URL pointer not preserved: got %p, want %p", got.urlPointer, r2.URL)
+	}
 }

@@ -62,6 +62,7 @@ Configuration uses typed structs. `nil` means disabled.
 | `PerIPConfig.Rate` | Sustained request rate per client |
 | `PerIPConfig.MaxInFlight` | Max concurrent requests per client. Zero = disabled (rate limiting only). |
 | `PerIPConfig.ProxyHeader` | Extract real client IP from a header (e.g. `X-Forwarded-For`), using the rightmost value. Empty = use RemoteAddr. |
+| `Config.OnReject` | Optional callback invoked on every rejection; receives the `RejectReason`. Nil = default 429 text body with `Retry-After: 1` on rate-limit paths. |
 
 When burst is set without rate (or vice versa), `New` defaults the missing value so the token bucket is usable. For example, `PerIPConfig{Rate: 10}` alone defaults burst to 10.
 
@@ -70,6 +71,28 @@ When burst is set without rate (or vice versa), `New` defaults the missing value
 - A non-nil config has all zero values (at least one limit required)
 - Any value is negative
 - `MaxInFlight` exceeds `math.MaxInt32`
+
+### Custom rejection responses
+
+Set `OnReject` to take full control of rejected-request responses — distinguish the four causes, vary `Retry-After`, or emit a structured envelope. The callback owns the wire format; loadshedder writes nothing after it returns.
+
+```go
+ls := loadshedder.New(loadshedder.Config{
+    Server: &loadshedder.ServerConfig{Burst: 5000, Rate: 3500},
+    PerIP:  &loadshedder.PerIPConfig{Burst: 3000, Rate: 2000, MaxInFlight: 256},
+    OnReject: func(w http.ResponseWriter, r *http.Request, reason loadshedder.RejectReason) {
+        switch reason {
+        case loadshedder.RejectServerRate, loadshedder.RejectPerIPRate:
+            w.Header().Set("Retry-After", "1")
+        }
+        w.Header().Set("Content-Type", "application/json")
+        w.WriteHeader(http.StatusTooManyRequests)
+        _, _ = w.Write([]byte(`{"error":"` + reason.String() + `"}`))
+    },
+})
+```
+
+Omitting `OnReject` keeps the existing `text/plain` 429 body and adds a `Retry-After: 1` header on rate-limit rejections (server rate, per-IP rate). In-flight rejections omit `Retry-After` because slot release time is not predictable.
 
 ### Deployment examples
 
